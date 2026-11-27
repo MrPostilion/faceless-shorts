@@ -463,7 +463,19 @@ def run_transcribe(args):
     # Text(): transcripts contain "[MUSIC PLAYING]"-style tags rich would eat as markup.
     console.print(Panel(Text(text[:1500]), title="Transcript Preview", border_style="green"))
 
+def _utf8_redirected_output():
+    """Windows gives redirected stdout/stderr the ANSI code page (cp1252), so
+    printing "✓" or a transcript's non-Latin text raises UnicodeEncodeError
+    after the work is done. A real console is already UTF-8."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if (getattr(stream, "encoding", "") or "").lower() not in ("utf-8", "utf8"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
 def main():
+    _utf8_redirected_output()
     parser = argparse.ArgumentParser(
         description="Faceless Shorts: 100% Free AI Faceless Video Generator for YouTube Shorts, Reels, and TikTok."
     )
@@ -511,7 +523,7 @@ def main():
     # transcribe command (local Whisper via FFmpeg)
     tr_parser = subparsers.add_parser("transcribe", help="Transcribe any audio/video to SRT using local Whisper (FFmpeg built-in, 100%% offline)")
     tr_parser.add_argument("input", type=str, help="Path to audio/video file")
-    tr_parser.add_argument("--language", type=str, default="auto", help="Language code (auto, en, hi, es, ...). 'auto' detects it; 'en' uses the English-only model")
+    tr_parser.add_argument("--language", type=str, default="en", help="Language code (en, hi, es, ...; default en). 'auto' detects it from the opening speech, but accents can fool it, so pass the code when you know it")
     tr_parser.add_argument("--model", type=str, default="base", choices=["tiny", "base", "small", "medium", "large"], help="Whisper model size ('large' = large-v3)")
     tr_parser.add_argument("-o", "--output", type=str, help="Output file path: .srt (default), .txt or .json")
 

@@ -69,9 +69,14 @@ COMFY_POLL_INTERVAL = 0.5       # seconds between /history polls
 COMFY_POLL_TIMEOUT = 120.0      # total seconds to wait for a ComfyUI render
 YTDLP_TIMEOUT = 300.0           # cap for a single yt-dlp download
 TRANSCRIBE_TIMEOUT = 600.0      # cap for an ffmpeg whisper transcription
-# Seconds of audio the whisper filter buffers per pass. FFmpeg's 3s default
-# gives choppy segments and re-detects the language every 3s with "auto".
-WHISPER_QUEUE_SECONDS = 20
+# Seconds of audio the whisper filter hands whisper.cpp per pass. Each pass
+# starts cold and is cut blindly, so short queues (FFmpeg's default is 3s)
+# split and repeat words at every cut and lose the story's context: "gun
+# dotter" for "granddaughter". Given a whole clip, whisper.cpp walks it in 30s
+# windows itself, ending each at a sentence and carrying the text forward.
+# 30 min of 16 kHz float audio is ~115 MB; longer files get a cut every 30 min.
+# (The filter's VAD cuts at every short pause instead; that measured worse.)
+WHISPER_QUEUE_SECONDS = 1800
 
 DEFAULT_COMFY_URL = "http://127.0.0.1:8188"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
@@ -284,6 +289,70 @@ def _parse_whisper_json(payload: str) -> Optional[List[Dict[str, Any]]]:
     return segments or None
 
 
+def _whisper_language(language: Optional[str]) -> str:
+    """Map our language argument to the whisper filter's ``language`` value.
+
+    FFmpeg's own ``auto`` re-detects the language on every queued chunk, so a
+    stretch of accented English can come out as Swahili or Korean. ``lock``
+    detects it on the first chunk with speech and keeps it for the whole
+    file; ``eval`` (per-chunk detection) and explicit codes pass through.
+    """
+    lang = (language or "").strip()
+    return "lock" if lang.lower() in ("", "auto") else lang
+
+
+def _normalized_text(text: Any) -> str:
+    return re.sub(r"[\W_]+", " ", str(text)).strip().lower()
+
+
+def _merge_repeated_segments(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Fold whisper repetition loops: consecutive segments with the same text
+    become one segment spanning all of them (``end`` taken from the last)."""
+    merged: List[Dict[str, Any]] = []
+    for segment in segments:
+        text = _normalized_text(segment.get("text", ""))
+        if merged and text and text == _normalized_text(merged[-1].get("text", "")):
+            merged[-1]["end"] = segment.get("end", merged[-1].get("end"))
+            continue
+        merged.append(dict(segment))
+    return merged
+
+
+_SRT_TIMING = re.compile(r"^\s*(\S+)\s*-->\s*(\S+)")
+
+
+def _clean_srt(payload: str) -> str:
+    """Renumber the whisper filter's SRT cues from 1 (FFmpeg starts at 0) and
+    fold repetition loops. Input that holds no cue comes back unchanged."""
+    cues: List[Dict[str, Any]] = []
+    for block in re.split(r"\n[ \t]*\n", payload.replace("\r\n", "\n")):
+        lines = block.strip("\n").split("\n")
+        for i, line in enumerate(lines):
+            timing = _SRT_TIMING.match(line)
+            if timing:
+                text = "\n".join(lines[i + 1:]).strip()
+                if text:
+                    cues.append({"start": timing.group(1), "end": timing.group(2), "text": text})
+                break
+    if not cues:
+        return payload
+    return "".join(
+        f"{n}\n{cue['start']} --> {cue['end']}\n{cue['text']}\n\n"
+        for n, cue in enumerate(_merge_repeated_segments(cues), start=1)
+    )
+
+
+def _clean_text_transcript(payload: str) -> str:
+    """Drop consecutive duplicate lines (whisper repetition loops)."""
+    kept: List[str] = []
+    for line in payload.splitlines(keepends=True):
+        text = _normalized_text(line)
+        if kept and text and text == _normalized_text(kept[-1]):
+            continue
+        kept.append(line)
+    return "".join(kept)
+
+
 def model_cache_dir() -> str:
     """Where whisper.cpp ggml models live (override: FACELESS_MODELS_DIR)."""
     custom = _env("FACELESS_MODELS_DIR")
@@ -480,13 +549,16 @@ class WhisperTranscriber:
         Called ONLY on demand - never automatically by ``transcribe()``.
         Streams to ``<cache>/*.part`` then renames atomically. Returns the
         absolute model path, or ``None`` on any failure. *model_size* falls
-        back to ``$FACELESS_WHISPER_MODEL``, then ``base``.
+        back to ``$FACELESS_WHISPER_MODEL``, then ``base``. A cached model
+        ``transcribe()`` would use (for English, the multilingual one too)
+        counts as cached, so no second ~0.5 GB download.
         """
         size = model_size or _env("FACELESS_WHISPER_MODEL", "base")
+        cached = cls._find_model(size, language)
+        if cached:
+            return cached  # already cached: no network access
         directory = model_cache_dir()
         destination = os.path.join(directory, cls._model_filename(size, language))
-        if os.path.isfile(destination) and os.path.getsize(destination) > 0:
-            return destination  # already cached: no network access
         try:
             os.makedirs(directory, exist_ok=True)
         except Exception:
@@ -524,9 +596,12 @@ class WhisperTranscriber:
         """Run the ffmpeg ``whisper`` filter on *media_path*.
 
         Returns a list of segment dicts ``{"start", "end", "text", "language"}``
-        (milliseconds) for ``out_format="json"``, the raw file text for
-        ``text``/``srt``, or ``None`` on any failure. *language* ``None`` or
-        ``"auto"`` detects it. *timeout* ``None`` means no limit. NEVER
+        (milliseconds) for ``out_format="json"``, the file text for
+        ``text``/``srt``, or ``None`` on any failure. Consecutive repeated
+        segments (whisper repetition loops) are folded into one, and SRT cues
+        are numbered from 1. *language* ``None`` or ``"auto"`` detects it once
+        and keeps it for the whole file; ``"eval"`` re-detects every chunk.
+        *timeout* ``None`` means no limit. NEVER
         downloads a model: when the model file is absent it returns ``None``.
         """
         try:
@@ -548,9 +623,8 @@ class WhisperTranscriber:
                 f"format={out_format}",
                 f"destination={_ffmpeg_filter_value(destination)}",
                 f"queue={WHISPER_QUEUE_SECONDS}",
+                f"language={_ffmpeg_filter_value(_whisper_language(language))}",
             ]
-            if language:
-                options.append(f"language={_ffmpeg_filter_value(language)}")
             filter_expr = "whisper=" + ":".join(options)
             cmd = [
                 exe,
@@ -583,8 +657,11 @@ class WhisperTranscriber:
                 if not payload.strip():
                     return None
                 if out_format == "json":
-                    return _parse_whisper_json(payload)
-                return payload
+                    segments = _parse_whisper_json(payload)
+                    return _merge_repeated_segments(segments) if segments else None
+                if out_format == "srt":
+                    return _clean_srt(payload)
+                return _clean_text_transcript(payload)
             finally:
                 if os.path.exists(destination):
                     try:
